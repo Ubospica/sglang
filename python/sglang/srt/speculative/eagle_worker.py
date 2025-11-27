@@ -268,6 +268,8 @@ class EAGLEWorker(TpModelWorker):
             A tuple of the final logit output of the target model, next tokens accepted,
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
+        import torch.cuda.nvtx as nvtx
+
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             logits_output, next_token_ids, seq_lens_cpu = self.forward_target_extend(
                 batch
@@ -285,15 +287,17 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=False,
             )
         else:
-            with self.draft_tp_context(
+            with nvtx.range("Draft"), self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context():
                 spec_info = self.draft(batch)
-            logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
-                self.verify(batch, spec_info)
-            )
 
-            with self.draft_tp_context(
+            with nvtx.range("Verify"):
+                logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
+                    self.verify(batch, spec_info)
+                )
+
+            with nvtx.range("Draft_Extend"), self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context():
                 # NOTE: We should use `check_forward_draft_extend_after_decode`
@@ -304,6 +308,10 @@ class EAGLEWorker(TpModelWorker):
                 ):
                     # decode is not finished
                     self.forward_draft_extend_after_decode(batch)
+
+            # NVTX: Mark CPU overhead for v1 (this is where sync happens)
+            with nvtx.range("CPU"):
+                pass  # CPU overhead is implicit after GPU sync
 
             return GenerationBatchResult(
                 logits_output=logits_output,

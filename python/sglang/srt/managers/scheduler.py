@@ -1014,7 +1014,19 @@ class Scheduler(
                 and self.last_batch.forward_mode.is_extend()
             )
 
-            if disable_overlap_for_batch:
+            # Grammar sync: ensure grammar state is updated before the current decode step.
+            # This is needed because grammar state must be updated with the generated/accepted
+            # tokens before we can generate the vocab mask for the next step.
+            # For speculative decoding, each decode step may accept multiple tokens,
+            # and all accepted tokens need to be processed by grammar.accept_token().
+            need_grammar_sync = (
+                batch is not None
+                and batch.forward_mode.is_decode()
+                and batch.has_grammar
+                and len(self.result_queue) > 0
+            )
+
+            if disable_overlap_for_batch or need_grammar_sync:
                 pop_and_process()
 
             batch_result = None
@@ -1023,7 +1035,7 @@ class Scheduler(
                 self.result_queue.append((batch.copy(), batch_result))
 
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if not disable_overlap_for_batch and not need_grammar_sync:
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
@@ -1972,7 +1984,8 @@ class Scheduler(
 
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.default_stream)
-                    self.future_map.resolve_future(model_worker_batch)
+                    with nvtx.range("R"):
+                        self.future_map.resolve_future(model_worker_batch)
                     batch_result = self.model_worker.forward_batch_generation(
                         model_worker_batch
                     )
@@ -1981,7 +1994,8 @@ class Scheduler(
                         self.device
                     ).Event()
                     if batch_result.delay_sample_func is None:
-                        self.future_map.store_to_map(future_indices, batch_result)
+                        with nvtx.range("W"):
+                            self.future_map.store_to_map(future_indices, batch_result)
                         batch_result.copy_to_cpu()
                     else:
                         batch_result.future_indices = future_indices
@@ -2065,7 +2079,8 @@ class Scheduler(
             self.forward_stream.wait_stream(self.default_stream)
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
-            self.future_map.store_to_map(batch_result.future_indices, batch_result)
+            with nvtx.range("W"):
+                self.future_map.store_to_map(batch_result.future_indices, batch_result)
             batch_result.copy_to_cpu()
 
     def process_batch_result(

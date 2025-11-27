@@ -144,25 +144,28 @@ class EagleDraftInputV2Mixin:
         topk: int,
         num_steps: int,
     ):
+        import torch.cuda.nvtx as nvtx
+
         if not batch.forward_mode.is_idle():
             bs = len(batch.seq_lens)
 
-            # Assign cache locations
-            batch.out_cache_loc = torch.empty(
-                (bs * topk * num_steps,),
-                dtype=torch.int64,
-                device=batch.input_ids.device,
-            )
-            # FIXME(lsyin): align with the default code path
-            assign_draft_cache_locs_page_size_1[(bs,)](
-                batch.req_pool_indices,
-                req_to_token_pool.req_to_token,
-                batch.seq_lens,
-                batch.out_cache_loc,
-                req_to_token_pool.req_to_token.shape[1],
-                topk,
-                num_steps,
-            )
+            # Assign cache locations (GPU kernel)
+            with nvtx.range("Prep_Draft"):
+                batch.out_cache_loc = torch.empty(
+                    (bs * topk * num_steps,),
+                    dtype=torch.int64,
+                    device=batch.input_ids.device,
+                )
+                # FIXME(lsyin): align with the default code path
+                assign_draft_cache_locs_page_size_1[(bs,)](
+                    batch.req_pool_indices,
+                    req_to_token_pool.req_to_token,
+                    batch.seq_lens,
+                    batch.out_cache_loc,
+                    req_to_token_pool.req_to_token.shape[1],
+                    topk,
+                    num_steps,
+                )
 
         # Get a forward batch
         self.num_tokens_per_batch = topk
@@ -181,6 +184,8 @@ class EagleDraftInputV2Mixin:
         draft_model_runner: Any,
         cuda_graph_runner: Any,
     ):
+        import torch.cuda.nvtx as nvtx
+
         seq_lens_cpu_ = batch.seq_lens_cpu
         extend_num_tokens = len(batch.seq_lens) * num_draft_tokens
 
@@ -201,7 +206,8 @@ class EagleDraftInputV2Mixin:
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         if not batch.forward_mode.is_idle() and not can_cuda_graph:
-            draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+            with nvtx.range("Prep_Draft_Extend"):
+                draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         return forward_batch
 
 
@@ -213,20 +219,23 @@ class EagleVerifyInputV2Mixin:
         batch: ModelWorkerBatch,
         target_worker: TpModelWorker,
     ):
+        import torch.cuda.nvtx as nvtx
+
         if not batch.forward_mode.is_idle():
-            # Assign cache locations
-            bs = len(batch.req_pool_indices)
-            batch.input_ids = self.draft_token
-            device = batch.input_ids.device
-            batch.out_cache_loc = assign_extend_cache_locs_func(
-                req_pool_indices=batch.req_pool_indices,
-                req_to_token=req_to_token_pool.req_to_token,
-                start_offset=batch.seq_lens,
-                end_offset=batch.seq_lens + self.draft_token_num,
-                batch_size=bs,
-                draft_token_num=self.draft_token_num,
-                device=device,
-            )
+            # Assign cache locations (GPU kernel)
+            with nvtx.range("Prep_Verify"):
+                bs = len(batch.req_pool_indices)
+                batch.input_ids = self.draft_token
+                device = batch.input_ids.device
+                batch.out_cache_loc = assign_extend_cache_locs_func(
+                    req_pool_indices=batch.req_pool_indices,
+                    req_to_token=req_to_token_pool.req_to_token,
+                    start_offset=batch.seq_lens,
+                    end_offset=batch.seq_lens + self.draft_token_num,
+                    batch_size=bs,
+                    draft_token_num=self.draft_token_num,
+                    device=device,
+                )
 
         # Get a forward batch
         batch.forward_mode = (
@@ -237,18 +246,21 @@ class EagleVerifyInputV2Mixin:
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
-        # Run attention backend plan and cuda graph preparation
+        # Run attention backend plan and cuda graph preparation (GPU ops)
         can_run_cuda_graph = bool(
             target_worker.model_runner.graph_runner
             and target_worker.model_runner.graph_runner.can_run(verify_forward_batch)
         )
-        if can_run_cuda_graph:
-            target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)
-        else:
-            if not batch.forward_mode.is_idle():
-                target_worker.model_runner.attn_backend.init_forward_metadata(
+        with nvtx.range("Prep_Verify"):
+            if can_run_cuda_graph:
+                target_worker.model_runner.graph_runner.replay_prepare(
                     verify_forward_batch
                 )
+            else:
+                if not batch.forward_mode.is_idle():
+                    target_worker.model_runner.attn_backend.init_forward_metadata(
+                        verify_forward_batch
+                    )
 
         return verify_forward_batch, can_run_cuda_graph
 
@@ -256,6 +268,7 @@ class EagleVerifyInputV2Mixin:
         self: EagleVerifyInput,
         batch: ModelWorkerBatch,
         logits_output: LogitsProcessorOutput,
+        vocab_mask: torch.Tensor = None,
     ):
         """
         Verify and find accepted tokens based on logits output and batch
@@ -276,9 +289,17 @@ class EagleVerifyInputV2Mixin:
         next_token_logits = logits_output.next_token_logits
         device = batch.input_ids.device
 
+        # Apply grammar mask if provided
+        if vocab_mask is not None:
+            assert self.grammar is not None
+            self.grammar.apply_vocab_mask(
+                logits=next_token_logits, vocab_mask=vocab_mask
+            )
+
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
-        predict_shape = list(next_token_logits.shape)[:-1]
-        predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
+        predict = torch.zeros(
+            (bs * (self.spec_steps + 1),), dtype=torch.int32, device=device
+        )
         accept_index = torch.full(
             (bs, self.spec_steps + 1), -1, dtype=torch.int32, device=device
         )

@@ -36,6 +36,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     detect_nan,
     draft_tp_context,
+    generate_token_bitmask,
     load_token_map,
 )
 from sglang.srt.utils.common import (
@@ -258,7 +259,11 @@ class EagleDraftWorker(BaseDraftWorker):
             )
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
+        import torch.cuda.nvtx as nvtx
+
         draft_input: EagleDraftInput = model_worker_batch.spec_info
+
+        # Prepare (CPU + light GPU ops)
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
             self.req_to_token_pool,
             model_worker_batch,
@@ -268,57 +273,60 @@ class EagleDraftWorker(BaseDraftWorker):
             self.speculative_num_steps,
         )
 
-        # Run draft
-        if can_cuda_graph:
-            parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
-                forward_batch,
-            )
-        else:
-            if (
-                not forward_batch.forward_mode.is_idle()
-                and self.speculative_num_steps > 1
-            ):
-                # Skip attention backend init for 1-step draft,
-                # `draft_forward` only does sample in this case.
-                self.draft_attn_backend.init_forward_metadata(forward_batch)
-            parent_list, top_scores_index, draft_tokens = self.draft_forward(
-                forward_batch
+        # Run draft (GPU compute)
+        with nvtx.range("Draft"):
+            if can_cuda_graph:
+                parent_list, top_scores_index, draft_tokens = (
+                    self.cuda_graph_runner.replay(
+                        forward_batch,
+                    )
+                )
+            else:
+                if (
+                    not forward_batch.forward_mode.is_idle()
+                    and self.speculative_num_steps > 1
+                ):
+                    # Skip attention backend init for 1-step draft,
+                    # `draft_forward` only does sample in this case.
+                    self.draft_attn_backend.init_forward_metadata(forward_batch)
+                parent_list, top_scores_index, draft_tokens = self.draft_forward(
+                    forward_batch
+                )
+
+            if model_worker_batch.forward_mode.is_idle():
+                return EagleVerifyInput.create_idle_input(
+                    self.topk,
+                    self.speculative_num_steps,
+                    self.speculative_num_draft_tokens,
+                )
+
+            # Build tree mask
+            # Directly write to cuda graph buffers for verify attn
+            tree_mask_buf, position_buf = (
+                self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
             )
 
-        if model_worker_batch.forward_mode.is_idle():
-            return EagleVerifyInput.create_idle_input(
+            (
+                tree_mask,
+                position,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                draft_tokens,
+            ) = build_tree_kernel_efficient(
+                draft_input.verified_id,
+                parent_list,
+                top_scores_index,
+                draft_tokens,
+                model_worker_batch.seq_lens,
+                model_worker_batch.seq_lens_sum,
                 self.topk,
                 self.speculative_num_steps,
                 self.speculative_num_draft_tokens,
+                self.tree_mask_mode,
+                tree_mask_buf,
+                position_buf,
             )
-
-        # Build tree mask
-        # Directly write to cuda graph buffers for verify attn
-        tree_mask_buf, position_buf = (
-            self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
-        )
-
-        (
-            tree_mask,
-            position,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            draft_tokens,
-        ) = build_tree_kernel_efficient(
-            draft_input.verified_id,
-            parent_list,
-            top_scores_index,
-            draft_tokens,
-            model_worker_batch.seq_lens,
-            model_worker_batch.seq_lens_sum,
-            self.topk,
-            self.speculative_num_steps,
-            self.speculative_num_draft_tokens,
-            self.tree_mask_mode,
-            tree_mask_buf,
-            position_buf,
-        )
 
         return EagleVerifyInput(
             draft_token=draft_tokens,
@@ -469,6 +477,8 @@ class EagleDraftWorker(BaseDraftWorker):
     def _draft_extend_for_decode(
         self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
     ):
+        import torch.cuda.nvtx as nvtx
+
         # Batch 2: Draft extend
         draft_input = EagleDraftInput(
             hidden_states=batch_result.logits_output.hidden_states,
@@ -482,7 +492,7 @@ class EagleDraftWorker(BaseDraftWorker):
             - 1
         )
 
-        # Prepare for draft extend in a separate stream
+        # Prepare for draft extend (in plan_stream if overlap enabled)
         with self.plan_stream_ctx:
             forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache(
                 batch,
@@ -497,28 +507,29 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.plan_stream
             )
 
-        # Run draft extend batch in the main compute stream
-        can_cuda_graph = (
-            self.cuda_graph_runner_for_draft_extend
-            and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
-        )
-        if can_cuda_graph:
-            draft_logits_output = self.cuda_graph_runner_for_draft_extend.replay(
-                forward_batch
+        # Run draft extend batch in the main compute stream (GPU compute)
+        with nvtx.range("Draft_Extend"):
+            can_cuda_graph = (
+                self.cuda_graph_runner_for_draft_extend
+                and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
             )
-        else:
-            draft_logits_output, _ = self.draft_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            )
+            if can_cuda_graph:
+                draft_logits_output = self.cuda_graph_runner_for_draft_extend.replay(
+                    forward_batch
+                )
+            else:
+                draft_logits_output, _ = self.draft_runner.forward(
+                    forward_batch, skip_attn_backend_init=True
+                )
 
-        # Reorganize the spec info for the next batch
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
-            select_index
-        ]
-        draft_logits_output.hidden_states = draft_logits_output.hidden_states[
-            select_index
-        ]
-        probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
+            # Reorganize the spec info for the next batch
+            draft_logits_output.next_token_logits = (
+                draft_logits_output.next_token_logits[select_index]
+            )
+            draft_logits_output.hidden_states = draft_logits_output.hidden_states[
+                select_index
+            ]
+            probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
         ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
         ret_hidden_states = draft_logits_output.hidden_states
 
@@ -592,6 +603,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         pass
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
+        import torch.cuda.nvtx as nvtx
+
         if (
             model_worker_batch.forward_mode.is_extend()
             or model_worker_batch.is_extend_in_batch
@@ -619,14 +632,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
+
             verify_input: EagleVerifyInput = self.draft_worker.draft(model_worker_batch)
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input
+
             batch_output = self.verify(model_worker_batch)
+
             self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output)
+
             return batch_output
 
     def verify(self, batch: ModelWorkerBatch):
+        import torch.cuda.nvtx as nvtx
+
         # Since batch.seq_lens is allocated in another stream, we need
         # record_stream() to prevent pytorch gc and reuse the gpu memory
         # while forward_stream is still running.
@@ -639,7 +658,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         bs = len(batch.seq_lens)
 
         # Batch 1: Target verify
-        # Prepare for target verify in a separate stream
+        # Prepare for target verify (in plan_stream if overlap enabled)
         with self.plan_stream_ctx:
             verify_forward_batch, can_run_cuda_graph = (
                 verify_input.prepare_for_v2_verify(
@@ -649,7 +668,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
             )
 
-        # Correct some buffers due to the overlap plan
         if self.plan_stream:
             torch.get_device_module(self.device).current_stream().wait_stream(
                 self.plan_stream
@@ -667,38 +685,70 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
             )
 
-        # Run target verify batch in the main compute stream
-        forward_batch_output = self.target_worker.forward_batch_generation(
-            model_worker_batch=None,
-            forward_batch=verify_forward_batch,
-            is_verify=True,
-            skip_attn_backend_init=True,
-        )
-        logits_output = forward_batch_output.logits_output
+        # Prepare grammar data on CPU if needed
+        if batch.has_grammar:
+            retrieve_next_token_cpu = verify_input.retrive_next_token.cpu()
+            retrieve_next_sibling_cpu = verify_input.retrive_next_sibling.cpu()
+            draft_tokens_cpu = verify_input.draft_token.view(
+                verify_input.retrive_next_token.shape
+            ).cpu()
 
-        # Sample
-        if self.enable_nan_detection:
-            detect_nan(logits_output)
-        (
-            predict,
-            accept_length,
-            accept_index,
-        ) = verify_input.sample(batch, logits_output)
-        new_seq_lens = batch.seq_lens + accept_length
-        verify_done = torch.get_device_module(self.device).Event()
-        verify_done.record()
-
-        if not batch.forward_mode.is_idle():
-            all_verified_id = predict[accept_index]
-            verified_id = torch.empty_like(accept_length, dtype=torch.int32)
-            fill_new_verified_id[(bs,)](
-                all_verified_id,
-                accept_length,
-                verified_id,
-                self.speculative_num_draft_tokens,
+        # Run target verify batch in the main compute stream (GPU compute)
+        with nvtx.range("Verify"):
+            forward_batch_output = self.target_worker.forward_batch_generation(
+                model_worker_batch=None,
+                forward_batch=verify_forward_batch,
+                is_verify=True,
+                skip_attn_backend_init=True,
             )
-        else:
-            verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
+            logits_output = forward_batch_output.logits_output
+
+            # Generate vocab mask for constrained decoding
+            vocab_mask = None
+            if batch.has_grammar:
+                with nvtx.range("Generate_Vocab_Mask"):
+                    # Generate the logit mask for structured output.
+                    vocab_mask = generate_token_bitmask(
+                        batch.reqs,
+                        verify_input,
+                        retrieve_next_token_cpu,
+                        retrieve_next_sibling_cpu,
+                        draft_tokens_cpu,
+                        batch.sampling_info.vocab_size,
+                    )
+
+                    if vocab_mask is not None:
+                        assert verify_input.grammar is not None
+                        vocab_mask = vocab_mask.to(
+                            verify_input.retrive_next_token.device
+                        )
+                        # NOTE: otherwise, this vocab mask will be the one from the previous extend stage
+                        # and will be applied to produce wrong results
+                        batch.sampling_info.vocab_mask = None
+
+            # Sample
+            if self.enable_nan_detection:
+                detect_nan(logits_output)
+            (
+                predict,
+                accept_length,
+                accept_index,
+            ) = verify_input.sample(batch, logits_output, vocab_mask)
+            new_seq_lens = batch.seq_lens + accept_length
+            verify_done = torch.get_device_module(self.device).Event()
+            verify_done.record()
+
+            if not batch.forward_mode.is_idle():
+                all_verified_id = predict[accept_index]
+                verified_id = torch.empty_like(accept_length, dtype=torch.int32)
+                fill_new_verified_id[(bs,)](
+                    all_verified_id,
+                    accept_length,
+                    verified_id,
+                    self.speculative_num_draft_tokens,
+                )
+            else:
+                verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
 
         # Construct the next draft input
         next_draft_input = EagleDraftInput(
