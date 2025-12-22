@@ -106,6 +106,25 @@ class FutureMap:
                 device=self.device,
             )
 
+        # Grammar buffers are lazily initialized when needed
+        self.grammar_buf_initialized = False
+        self.accepted_tokens_buf = None
+        self.accept_lens_buf = None
+
+    def _lazy_init_grammar_buf(self, num_draft_tokens: int):
+        """Lazily initialize grammar buffers for storing accepted tokens."""
+        self.grammar_buf_initialized = True
+        self.accepted_tokens_buf = torch.empty(
+            (self.future_buffer_len, num_draft_tokens),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.accept_lens_buf = torch.empty(
+            (self.future_buffer_len,),
+            dtype=torch.int32,
+            device=self.device,
+        )
+
     def alloc_future_indices(self, bs: int) -> FutureIndices:
         """Update the circular buffer pointer and allocate future indices."""
         cur_future_ct = self.future_ct
@@ -166,3 +185,44 @@ class FutureMap:
         self.new_seq_lens_buf[intv] = draft_input.new_seq_lens
         if spec_need_hidden_states():
             self.hidden_states_buf[intv] = draft_input.hidden_states
+
+    def store_grammar_info(
+        self,
+        future_indices: FutureIndices,
+        accepted_tokens: torch.Tensor,
+        accept_lens: torch.Tensor,
+        num_draft_tokens: int,
+    ):
+        """
+        Store grammar accept info for overlapped grammar processing.
+
+        Args:
+            future_indices: The future indices allocated for this batch
+            accepted_tokens: All accepted tokens, shape (bs * num_draft_tokens,)
+            accept_lens: Accept length for each request, shape (bs,)
+            num_draft_tokens: Number of draft tokens per request
+        """
+        intv = future_indices.interval
+        if self.is_empty_slice(intv):
+            return
+
+        if not self.grammar_buf_initialized:
+            self._lazy_init_grammar_buf(num_draft_tokens)
+
+        bs = accept_lens.shape[0]
+        # Reshape accepted_tokens to (bs, num_draft_tokens)
+        self.accepted_tokens_buf[intv] = accepted_tokens.view(bs, num_draft_tokens)
+        self.accept_lens_buf[intv] = accept_lens
+
+    def get_grammar_info(self, future_indices: FutureIndices):
+        """
+        Get grammar accept info from the buffer.
+
+        Args:
+            future_indices: The future indices to retrieve
+
+        Returns:
+            Tuple of (accepted_tokens, accept_lens) tensors
+        """
+        indices = future_indices.indices
+        return self.accepted_tokens_buf[indices], self.accept_lens_buf[indices]

@@ -589,6 +589,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
+        # FutureMap for grammar processing (set by scheduler after initialization)
+        self.future_map = None
+
     @property
     def target_worker(self):
         return self._target_worker
@@ -632,11 +635,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
+            # Save future_indices before draft replaces spec_info
+            draft_input: EagleDraftInput = model_worker_batch.spec_info
+            future_indices = (
+                draft_input.future_indices if draft_input is not None else None
+            )
             with speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 verify_input: EagleVerifyInput = self.draft_worker.draft(
                     model_worker_batch
                 )
             assert verify_input.is_verify_input()
+            # Pass future_indices to verify_input for grammar processing
+            verify_input.future_indices = future_indices
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch)
             with speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
@@ -704,6 +714,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
         logits_output = forward_batch_output.logits_output
 
+        # Process pending accept tokens from last batch (overlapped with GPU forward)
+        # This updates grammar state before generating bitmask for current batch
+        if (
+            batch.has_grammar
+            and self.future_map is not None
+            and batch.spec_info is not None
+            and batch.spec_info.future_indices is not None
+        ):
+            self._accept_tokens_from_future_map(batch)
+
         # Generate vocab mask for constrained decoding
         vocab_mask = None
         if batch.has_grammar:
@@ -762,6 +782,33 @@ class EAGLEWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
         )
+
+    def _accept_tokens_from_future_map(self, batch: ModelWorkerBatch):
+        """
+        Accept tokens from FutureMap for grammar state update.
+        This retrieves the accepted tokens from the last batch stored in FutureMap
+        and updates the grammar state for each request.
+
+        Args:
+            batch: Current batch containing requests and spec_info with future_indices
+        """
+        future_indices = batch.spec_info.future_indices
+        accepted_tokens, accept_lens = self.future_map.get_grammar_info(future_indices)
+
+        # Convert to CPU for grammar processing
+        accepted_tokens_cpu = accepted_tokens.cpu().tolist()
+        accept_lens_cpu = accept_lens.cpu().tolist()
+
+        for i, req in enumerate(batch.reqs):
+            if req.grammar is not None and not req.finished() and not req.is_retracted:
+                try:
+                    for j in range(accept_lens_cpu[i]):
+                        req.grammar.accept_token(accepted_tokens_cpu[i][j])
+                except ValueError as e:
+                    logger.error(
+                        f"Grammar accept_token failed for req {req.rid} "
+                        f"with tokens {accepted_tokens_cpu[i][:accept_lens_cpu[i]]}: {e}"
+                    )
 
     def move_accepted_tokens_to_target_kvcache(
         self,

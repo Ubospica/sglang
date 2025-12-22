@@ -978,6 +978,9 @@ class Scheduler(
             self.device,
             self.spec_algorithm,
         )
+        # Pass future_map to draft_worker for grammar processing
+        if self.draft_worker is not None:
+            self.draft_worker.future_map = self.future_map
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
 
@@ -1135,18 +1138,11 @@ class Scheduler(
             and self.last_batch.forward_mode.is_extend()
         )
 
-        # We do not support overlap + spec + grammar yet,
-        # so we need to turn off overlap for this batch.
-        # TODO(lsyin): support overlap + spec + grammar
-        need_grammar_sync = (
-            batch
-            and batch.is_eagle_v2
-            and batch.has_grammar
-            and batch.forward_mode.is_decode()
-            and len(self.result_queue) > 0
-        )
+        # NOTE: overlap + spec + grammar is now supported.
+        # The pending accept tokens from last batch will be processed during
+        # verify forward to overlap CPU grammar operations with GPU compute.
 
-        return disable_overlap_for_batch or need_grammar_sync
+        return disable_overlap_for_batch
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -2151,6 +2147,44 @@ class Scheduler(
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
                         self.future_map.store_to_map(future_indices, batch_result)
+                        # Store grammar info for overlapped grammar processing
+                        if batch.is_eagle_v2 and batch.has_grammar:
+                            if batch_result.accept_lens is not None:
+                                # Decode: use actual accept_lens
+                                self.future_map.store_grammar_info(
+                                    future_indices,
+                                    batch_result.next_token_ids,
+                                    batch_result.accept_lens,
+                                    self.server_args.speculative_num_draft_tokens,
+                                )
+                            else:
+                                # Prefill: each request has 1 token
+                                bs = batch_result.next_token_ids.shape[0]
+                                accept_lens = torch.ones(
+                                    bs,
+                                    dtype=torch.int32,
+                                    device=batch_result.next_token_ids.device,
+                                )
+                                # Pad next_token_ids to match decode layout
+                                num_draft_tokens = (
+                                    self.server_args.speculative_num_draft_tokens
+                                )
+                                padded_tokens = torch.zeros(
+                                    bs * num_draft_tokens,
+                                    dtype=batch_result.next_token_ids.dtype,
+                                    device=batch_result.next_token_ids.device,
+                                )
+                                # Put each token at position 0 of each request's slot
+                                padded_tokens[::num_draft_tokens] = (
+                                    batch_result.next_token_ids
+                                )
+                                self.future_map.store_grammar_info(
+                                    future_indices,
+                                    padded_tokens,
+                                    accept_lens,
+                                    num_draft_tokens,
+                                )
+                            batch_result.grammar_accept_processed = True
                         batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
                     else:
                         batch_result.future_indices = future_indices

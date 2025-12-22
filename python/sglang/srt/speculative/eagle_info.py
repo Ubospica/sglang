@@ -68,6 +68,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     seq_lens_cpu: torch.Tensor
     grammar: BaseGrammarObject = None
 
+    # For overlapped grammar processing
+    future_indices: Optional["FutureIndices"] = None
+
     # Shape info for padding
     num_tokens_per_batch: int = -1
 
